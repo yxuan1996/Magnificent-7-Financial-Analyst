@@ -1,8 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { createServerClient } from "@supabase/ssr";
+import { createServerClient, type CookieOptionsWithName } from "@supabase/ssr";
 
-// This middleware refreshes the Supabase session on every request
-// so cookies stay up-to-date without the user having to manually refresh.
+// Refreshes the Supabase session on every request so cookies stay current.
 export async function middleware(request: NextRequest) {
   let supabaseResponse = NextResponse.next({ request });
 
@@ -14,8 +13,8 @@ export async function middleware(request: NextRequest) {
         getAll() {
           return request.cookies.getAll();
         },
-        setAll(cookiesToSet) {
-          // Mirror cookies onto both the request and the response
+        // Explicit type annotation fixes the implicit 'any' build error
+        setAll(cookiesToSet: CookieOptionsWithName[]) {
           cookiesToSet.forEach(({ name, value }) =>
             request.cookies.set(name, value)
           );
@@ -28,17 +27,13 @@ export async function middleware(request: NextRequest) {
     }
   );
 
-  // Refresh session (important — do not remove)
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  // Refresh session — must not be removed
+  const { data: { user } } = await supabase.auth.getUser();
 
-  // Redirect unauthenticated users away from /chat
   if (!user && request.nextUrl.pathname.startsWith("/chat")) {
     return NextResponse.redirect(new URL("/login", request.url));
   }
 
-  // Redirect authenticated users away from /login
   if (user && request.nextUrl.pathname.startsWith("/login")) {
     return NextResponse.redirect(new URL("/chat", request.url));
   }
@@ -47,13 +42,5 @@ export async function middleware(request: NextRequest) {
 }
 
 export const config = {
-  matcher: [
-    /*
-     * Match all request paths EXCEPT:
-     * - _next/static (static files)
-     * - _next/image  (image optimization)
-     * - favicon.ico
-     */
-    "/((?!_next/static|_next/image|favicon.ico).*)",
-  ],
+  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
 };
