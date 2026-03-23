@@ -2,7 +2,6 @@ import { tool } from "@langchain/core/tools";
 import { runQuery } from "@/lib/neo4j";
 import { z } from "zod";
 
-// Valid category values matching the graph schema
 const CategoryEnum = z.enum([
   "M&A",
   "Restructuring",
@@ -25,20 +24,30 @@ function formatResults(records: Record<string, unknown>[]): string {
 
 export const getKeyDevelopmentsTool = tool(
   async ({ ticker, category, fiscal_year }) => {
-    // Build optional filters
+    console.log("\n[getKeyDevelopments] Called with:", {
+      ticker,
+      category,
+      fiscal_year,
+    });
+
+    const tickerUpper    = ticker.toUpperCase();
     const categoryFilter = category
       ? "AND toLower(kd.category) = toLower($category)"
       : "";
-
-    const yearFilter = fiscal_year
+    const yearFilter     = fiscal_year != null
       ? "AND fy.year = $fiscal_year"
       : "";
+
+    if (category)    console.log("[getKeyDevelopments] Category filter:", category);
+    if (fiscal_year) console.log("[getKeyDevelopments] Year filter:", fiscal_year);
+    if (!category && !fiscal_year)
+      console.log("[getKeyDevelopments] No filters — returning all developments for ticker.");
 
     const cypher = `
       MATCH (c:Company {ticker: $ticker})
       MATCH (doc:Document)-[:BELONGS_TO]->(c)
       MATCH (doc)-[:BELONGS_TO]->(fy:FiscalYear)
-      MATCH (doc)-[:MENTIONS]->(kd:KeyDevelopment)
+      MATCH (doc)-[:MENTIONS]->(kd:key_development)
       WHERE true ${categoryFilter} ${yearFilter}
       RETURN DISTINCT
         c.ticker          AS ticker,
@@ -50,13 +59,20 @@ export const getKeyDevelopmentsTool = tool(
       LIMIT 30
     `;
 
-    const records = await runQuery(cypher, {
-      ticker: ticker.toUpperCase(),
-      ...(category && { category }),
-      ...(fiscal_year && { fiscal_year }),
-    });
+    const params: Record<string, unknown> = { ticker: tickerUpper };
+    if (category)             params.category    = category;
+    if (fiscal_year != null)  params.fiscal_year = fiscal_year;
 
-    return formatResults(records);
+    const records = await runQuery(cypher, params);
+
+    const result = formatResults(records);
+    console.log(
+      `[getKeyDevelopments] Result: ${records.length} record(s)`,
+      records.length === 0
+        ? `⚠  No KeyDevelopment nodes found. Verify (doc)-[:MENTIONS]->(kd:KeyDevelopment) for ticker=${tickerUpper}`
+        : "✓"
+    );
+    return result;
   },
   {
     name: "get_key_developments",
@@ -66,13 +82,16 @@ export const getKeyDevelopmentsTool = tool(
       ticker: z
         .string()
         .describe("Company ticker symbol, e.g. AAPL, MSFT, NVDA"),
-      category: CategoryEnum.optional().describe(
-        "Optional category: M&A, Restructuring, Litigation, ProductLaunch, RegulatoryAction, or GuidanceChange"
-      ),
+      // FIX: .nullish() instead of .optional()
+      category: CategoryEnum
+        .nullish()
+        .describe(
+          "Optional category: M&A, Restructuring, Litigation, ProductLaunch, RegulatoryAction, or GuidanceChange"
+        ),
       fiscal_year: z
         .number()
         .int()
-        .optional()
+        .nullish()  // FIX: .nullish() instead of .optional()
         .describe("Optional fiscal year to filter by, e.g. 2023"),
     }),
   }

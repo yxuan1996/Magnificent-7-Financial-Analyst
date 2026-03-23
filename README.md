@@ -1,5 +1,3 @@
-# Magnificent-7-Financial-Analyst
-An AI-powered financial analysis chatbot for the Magnificent 7 tech companies, demonstrating RAG with Hybrid Search
 # Magnificent 7 — Financial Analyst
 
 An AI-powered financial analysis chatbot for the Magnificent 7 tech companies, demonstrating **RAG with Hybrid Search** using:
@@ -186,15 +184,77 @@ The vector index stores two types of chunks, differentiated by metadata keys:
 
 ## LangChain Agent Tools
 
-| Tool name | Source | Description |
-|-----------|--------|-------------|
-| `search_report_text` | Pinecone | Semantic search over narrative text |
-| `search_report_tables` | Pinecone | Semantic search over financial tables |
-| `get_financial_metric` | Neo4j | Single metric for one company/year |
-| `compare_metric_across_years` | Neo4j | Trend of one metric over all years |
-| `compare_metric_across_companies` | Neo4j | Peer comparison for one metric/year |
-| `get_key_persons` | Neo4j | Executives and board members |
-| `get_key_developments` | Neo4j | Corporate events by category/year |
+The agent is built with LangGraph's `createReactAgent` and is capped at **5 tool calls per response** (`recursionLimit = 12`). Tools are invoked in strict priority order — Neo4j first, then vector search, then web search as a last resort.
+
+### Tool priority
+
+```
+Tier 1 (Neo4j)   →   Tier 2 (Pinecone)   →   Tier 3 (SerpAPI)
+   try first            try if Tier 1           only if Tier 1
+                        returns no data          and Tier 2 both
+                                                 return no data,
+                                                 or user asks for
+                                                 current/live data
+```
+
+### Tool reference
+
+| Priority | Tool name | Source | Description |
+|----------|-----------|--------|-------------|
+| Tier 1 | `get_financial_metric` | Neo4j | Retrieve a specific metric for one company. Uses **fulltext fuzzy search** on `metricNameIndex` — see below. |
+| Tier 1 | `compare_metric_across_years` | Neo4j | Trend of one metric over all available fiscal years for one company. |
+| Tier 1 | `compare_metric_across_companies` | Neo4j | Peer comparison of one metric across multiple companies for a given fiscal year. |
+| Tier 1 | `get_key_persons` | Neo4j | Executives and board members, optionally filtered by role. |
+| Tier 1 | `get_key_developments` | Neo4j | Corporate events, optionally filtered by category and/or fiscal year. |
+| Tier 2 | `search_report_text` | Pinecone | Semantic search over narrative paragraph text (MD&A, risk factors, business overview). Metadata key: `company_ticker`. |
+| Tier 2 | `search_report_tables` | Pinecone | Semantic search over financial tables stored as Markdown (income statements, balance sheets, cash flow). Metadata key: `company_ticker`. |
+| Tier 3 | `web_search` | SerpAPI | Google search for latest news, current prices, recent earnings, or any data not in the knowledge base. Supports `general` and `news` engine modes. |
+
+### FinancialGraphTools — fulltext metric search
+
+All three financial graph tools resolve metric names through Neo4j's fulltext index rather than an exact string match. This handles typos, abbreviations, and natural-language variations.
+
+**Index definition:**
+
+```cypher
+CREATE FULLTEXT INDEX metricNameIndex FOR (n:Metric) ON EACH [n.name]
+```
+
+**How the Lucene query is built (`buildFtQuery`):**
+
+The helper function converts the user's metric name into a Lucene expression that combines a **wildcard** match (substring) with a **fuzzy** match (edit distance 2):
+
+```typescript
+// Single token  →  wildcard OR fuzzy
+"revenue"    →  "*revenue* OR revenue~2"
+
+// Multiple tokens  →  each token must appear (AND), each with wildcard+fuzzy
+"net income" →  "(*net* OR net~2) AND (*income* OR income~2)"
+```
+
+| Technique | Syntax | What it catches |
+|-----------|--------|-----------------|
+| Wildcard | `*revenue*` | Exact substring — "Total Revenue", "Revenue Growth" |
+| Fuzzy (edit distance 2) | `revenue~2` | Typos and abbreviations — "reveneu", "rev" |
+| AND (multi-token) | `(*net* OR net~2) AND (*income* OR income~2)` | Both words must appear anywhere in the metric name |
+
+**Two-phase Cypher pattern used in all three tools:**
+
+```cypher
+-- Phase 1: fuzzy fulltext lookup — returns best-matching Metric nodes
+CALL db.index.fulltext.queryNodes("metricNameIndex", $ftQuery)
+YIELD node AS m, score AS metricScore
+WITH m, metricScore ORDER BY metricScore DESC LIMIT 5
+
+-- Phase 2: graph traversal using the resolved metric nodes
+MATCH (c:Company {ticker: $ticker})
+MATCH (doc:Document)-[:BELONGS_TO]->(c)
+MATCH (doc)-[:REPORTS]->(fact:Fact)-[:FOR_METRIC]->(m)
+RETURN c.ticker, m.name, metricScore, fact.value, fact.unit
+ORDER BY metricScore DESC  -- highest-confidence metric match first
+```
+
+`metric_score` is included in every result row so you can see which metric name matched and how confidently.
 
 ---
 
@@ -219,12 +279,17 @@ In your Vercel project → **Settings → Environment Variables**, add **all** v
 
 - `NEXT_PUBLIC_SUPABASE_URL`
 - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
-- `OPENAI_API_KEY`
+- `AZURE_OPENAI_API_KEY`
+- `AZURE_OPENAI_API_INSTANCE_NAME`
+- `AZURE_OPENAI_API_DEPLOYMENT_NAME`
+- `AZURE_OPENAI_API_EMBEDDINGS_DEPLOYMENT_NAME`
+- `AZURE_OPENAI_API_VERSION`
 - `PINECONE_API_KEY`
 - `PINECONE_INDEX_NAME`
 - `NEO4J_URI`
 - `NEO4J_USERNAME`
 - `NEO4J_PASSWORD`
+- `SERPAPI_API_KEY`
 
 > ⚠️ **Neo4j URI for production:** Use a cloud-hosted Neo4j instance (e.g. Neo4j Aura) with a `neo4j+s://` URI so it's reachable from Vercel's serverless functions.
 

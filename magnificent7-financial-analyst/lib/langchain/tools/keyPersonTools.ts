@@ -2,7 +2,6 @@ import { tool } from "@langchain/core/tools";
 import { runQuery } from "@/lib/neo4j";
 import { z } from "zod";
 
-// Valid role values matching the graph schema
 const RoleEnum = z.enum([
   "CEO",
   "CFO",
@@ -24,29 +23,45 @@ function formatResults(records: Record<string, unknown>[]): string {
 
 export const getKeyPersonsTool = tool(
   async ({ ticker, role }) => {
-    // Build optional role filter
-    const roleFilter = role ? "AND toLower(kp.role) = toLower($role)" : "";
+    console.log("\n[getKeyPersons] Called with:", { ticker, role });
+
+    const tickerUpper = ticker.toUpperCase();
+    const roleFilter  = role
+      ? "AND toLower(kp.role) = toLower($role)"
+      : "";
+
+    if (role) {
+      console.log("[getKeyPersons] Role filter active:", role);
+    } else {
+      console.log("[getKeyPersons] No role filter — returning all roles.");
+    }
 
     const cypher = `
       MATCH (c:Company {ticker: $ticker})
       MATCH (doc:Document)-[:BELONGS_TO]->(c)
-      MATCH (doc)-[:MENTIONS]->(kp:KeyPerson)
+      MATCH (doc)-[:MENTIONS]->(kp:key_person)
       WHERE true ${roleFilter}
       RETURN DISTINCT
         c.ticker        AS ticker,
         kp.name         AS name,
-        kp.role         AS role,
-        kp.description  AS description
+        kp.role         AS role
       ORDER BY kp.role, kp.name
-      LIMIT 30
+      LIMIT 50
     `;
 
-    const records = await runQuery(cypher, {
-      ticker: ticker.toUpperCase(),
-      ...(role && { role }),
-    });
+    const params: Record<string, unknown> = { ticker: tickerUpper };
+    if (role) params.role = role;
 
-    return formatResults(records);
+    const records = await runQuery(cypher, params);
+
+    const result = formatResults(records);
+    console.log(
+      `[getKeyPersons] Result: ${records.length} record(s)`,
+      records.length === 0
+        ? `⚠  No KeyPerson nodes found. Verify (doc)-[:MENTIONS]->(kp:KeyPerson) exists for ticker=${tickerUpper}`
+        : "✓"
+    );
+    return result;
   },
   {
     name: "get_key_persons",
@@ -56,9 +71,12 @@ export const getKeyPersonsTool = tool(
       ticker: z
         .string()
         .describe("Company ticker symbol, e.g. AAPL, MSFT, NVDA"),
-      role: RoleEnum.optional().describe(
-        "Optional role filter: CEO, CFO, COO, Chairperson, or BoardMember"
-      ),
+      // FIX: .nullish() instead of .optional()
+      role: RoleEnum
+        .nullish()
+        .describe(
+          "Optional role filter: CEO, CFO, COO, Chairperson, or BoardMember"
+        ),
     }),
   }
 );
