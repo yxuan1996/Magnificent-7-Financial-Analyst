@@ -10,6 +10,22 @@ An AI-powered financial analysis chatbot for the Magnificent 7 tech companies, d
 
 ---
 
+## Web App
+[Web App Deployed to Vercel](https://magnificent-7-financial-analyst.vercel.app/chat)
+
+## Screenshots
+
+[Key Developments](Screenshots/key_developments.PNG)
+
+[Key Drivers](Screenshots/key_drivers.PNG)
+
+[Key Persons](Screenshots/key_person.PNG)
+
+[Comparing Metrics Across Companies](Screenshots/Metrics_across_companies.PNG)
+
+[Comparing Metrics Across Years](Screenshots/Metrics_across_years.PNG)
+
+
 ## Project Structure
 
 ```
@@ -59,11 +75,454 @@ magnificent7-financial-analyst/
 ├── tsconfig.json
 ├── .env.local.example
 └── README.md
+│
+└── ingestion-and-parsing/         # Data ingestion (outside the Next.js app)
+    ├── PDF_Annual_Shareholder_Reports.ipynb
+    └── SEC_Edgar.ipynb
+    └── key_development.md
+    └── key_person.md
+
 ```
 
 ---
 
-## Prerequisites
+## Data Ingestion
+
+The `ingestion-and-parsing/` folder sits **outside** the Next.js application and contains two Google Colab notebooks that build the knowledge base from scratch. Run these 2 notebooks once, then run the cypher queries in `key_development.md` and `key_person.md` directly in the neo4j database. The Next.js chat UI reads from the populated Pinecone and Neo4j instances. 
+
+### Knowledge Base Overview
+
+| Store | Populated by | Contents |
+|-------|-------------|----------|
+| **Pinecone** (index: `financial-reports`) | Both notebooks | Text chunks, financial statement tables, and annual report tables — all with `company_ticker` metadata |
+| **Neo4j** | Both notebooks | Company, FiscalYear, Document, Metric, Fact, KeyPerson, KeyDevelopment nodes and their relationships |
+| **Supabase Storage** | PDF notebook only | Intermediate JSON artefacts (OCR output, tables/facts) for resumability |
+
+---
+
+### Notebook 1 — PDF Annual Shareholder Reports
+
+**File:** `ingestion-and-parsing/PDF_Annual_Shareholder_Reports.ipynb`
+
+Processes the glossy PDF Annual Shareholder Reports (ARS filings) for the Magnificent 7 companies. These reports are rich in narrative prose, visual tables, and management commentary that complement the structured 10-K data.
+
+> **Company coverage notes:**
+> - Apple does not publish a separate glossy ARS — their 10-K serves as the annual report (handled by the SEC Edgar notebook).
+> - Meta and Tesla ARS filings are excluded (Tesla reports exceed 500 pages and are impractical for page-by-page OCR).
+> - Run the cypher queries in key_development.md and key_person.md to populate the knowledge base with Apple, Meta and Tesla data. 
+
+#### Pipeline Architecture
+
+```
+[SEC EDGAR ARS Filing]
+         |
+         v
+[Download PDF via EDGAR REST API]
+         |
+         v
+[Convert each page → PNG image]       ← pymupdf
+         |
+         v
+[Mistral Document AI OCR per page]    ← mistral-document-ai-2505 via Azure
+         |
+         +──────────────────────────────────────────────────────+
+         |                                                        |
+         v                                                        v
+[Combine full-document markdown]              [Async LLM extraction per page]
+         |                                    (AsyncAzureOpenAI GPT-5-mini)
+         v                                    (semaphore=10, tenacity retry×3)
+[Strip HTML table tags]                               |
+         |                                            +──────────────────+
+         v                                            |                  |
+[Chunk by paragraph with overlap]              [Tables]           [Key Persons &
+  target: 1200 chars | overlap: 12%          (markdown +          Developments]
+         |                                    description)               |
+         v                                            |                  v
+[Generate embeddings]                                v         [Deduplicate persons]
+(text-embedding-3-small)                  [Embed table description]     |
+         |                                            |                  v
+         v                                            v         [Generate Cypher queries]
+PINECONE (metadata_type="text")       PINECONE (metadata_type="table")  |
+                                                                         v
+                                                                  NEO4J GRAPH
+```
+
+#### Step-by-Step Breakdown
+
+**Step 1 — Download PDF reports from SEC EDGAR**
+
+The notebook queries the SEC EDGAR submissions API to find all ARS (Annual Report to Shareholders) filings for each company, then downloads the PDF for the last 3 years:
+
+```python
+# EDGAR submissions endpoint
+url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+# Filter for form type "ARS" or "ARS/A"
+filings.filter(form="ARS")
+```
+
+**Step 2 — Convert PDF pages to images**
+
+Each page in every PDF is rasterised to a PNG using `pymupdf`:
+
+```python
+doc = pymupdf.open(pdf_path)
+for page in doc:
+    pix = page.get_pixmap()
+    pix.save(f"pdf_images/{company}/{year}/{page.number:03}.png")
+```
+
+This produces one PNG per page, e.g. `AMZN/2023/001.png`.
+
+**Step 3 — OCR with Mistral Document AI**
+
+Each page image is base64-encoded and sent to the **Mistral Document AI** (model: `mistral-document-ai-2505`) endpoint hosted on Azure. The OCR returns structured markdown including inline images.
+
+Resilience is handled by `tenacity` with exponential backoff (min 2s → max 10s, up to 3 retries):
+
+```python
+@retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
+def ocr_mistral_image(image_path, endpoint, api_key, model="mistral-document-ai-2505"):
+    img_b64 = base64.b64encode(open(image_path, "rb").read()).decode()
+    payload = {
+        "model": model,
+        "document": {"type": "image_url", "image_url": f"data:image/png;base64,{img_b64}"}
+    }
+    response = requests.post(endpoint, headers={"Authorization": f"Bearer {api_key}"}, json=payload)
+    return response.json()
+```
+
+The JSON output for each document is saved and uploaded to **Supabase Storage** (bucket: `annual_report_json`) for intermediate storage and resumability.
+
+**Step 4 — Async LLM extraction of tables and entities**
+
+> ⚡ **Key performance innovation:** The notebook uses `AsyncAzureOpenAI` with `asyncio` semaphores to make **up to 10 concurrent requests** to GPT-5-mini, dramatically reducing processing time versus sequential calls. A 100-page document that would take ~50 minutes synchronously completes in ~5–6 minutes asynchronously.
+
+The extraction pipeline:
+
+```python
+# Semaphore limits concurrency to 10 simultaneous requests
+semaphore = asyncio.Semaphore(10)
+
+# Each page's markdown is sent concurrently
+tasks = [process_chunk_with_semaphore(semaphore, chunk, idx)
+         for idx, chunk in enumerate(markdown_pages)]
+
+results = await tqdm.gather(*tasks)  # preserves order via index
+results = sorted(results, key=lambda x: x["index"])
+```
+
+Each GPT-5-mini call extracts the following JSON structure:
+
+```json
+{
+  "tables": [
+    {
+      "table_markdown": "| Col1 | Col2 |\n|------|------|\n| ... |",
+      "rows": [["col1", "col2"], ["val1", "val2"]],
+      "table_description": "Revenue breakdown by segment for FY2023"
+    }
+  ],
+  "key_people": [
+    { "name": "Andy Jassy", "role": "CEO" }
+  ],
+  "key_developments": [
+    {
+      "title": "AWS Bedrock Launch",
+      "description": "Amazon launched AWS Bedrock...",
+      "category": "ProductLaunch"
+    }
+  ]
+}
+```
+
+**Allowed roles:** `CEO | CFO | COO | Chairperson | BoardMember`
+
+**Allowed development categories:** `M&A | Restructuring | Litigation | ProductLaunch | RegulatoryAction | GuidanceChange`
+
+Tenacity retries (up to 3×) handle rate limit errors (`429`) specifically:
+
+```python
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=20),
+       retry=retry_if_exception_type((RateLimitError, TimeoutError, ValueError)))
+async def call_azure_openai(chunk_text, chunk_index):
+    ...
+```
+
+The extracted JSON is saved and uploaded to Supabase Storage (bucket: `annual_report_tables_facts`).
+
+**Step 5 — Chunking strategy**
+
+Narrative text is chunked by paragraph with a tail-overlap strategy to preserve context across chunk boundaries:
+
+```
+chunk_0 → paragraph A
+chunk_1 → [tail of A] + paragraph B     ← 12% overlap
+chunk_2 → [tail of B] + paragraph C     ← 12% overlap
+```
+
+Parameters: `target_chunk_size=1200 chars`, `overlap_ratio=0.12`.
+
+HTML table tags are stripped from the markdown before chunking so tables are not double-counted (they are indexed separately).
+
+**Step 6 — Embeddings and Pinecone insertion**
+
+Text chunks and table descriptions are embedded using `text-embedding-3-small` in batches of 100 with 2.5-second delays between batches for rate limiting.
+
+**Pinecone vector ID format:**
+```
+{company_ticker}_{fiscal_year}_{document_type}_{metadata_type}_{index}
+e.g. AMZN_2023_Annual_Report_text_42
+```
+
+**Metadata schema for text chunks:**
+
+| Field | Value | Example |
+|-------|-------|---------|
+| `company_ticker` | Ticker symbol | `AMZN` |
+| `fiscal_year` | Year string | `2023` |
+| `document_type` | Source document type | `Annual_Report` |
+| `metadata_type` | Chunk type discriminator | `text` |
+| `text` | The chunk content | `"Amazon's cloud segment..."` |
+
+**Metadata schema for table chunks:**
+
+| Field | Value | Example |
+|-------|-------|---------|
+| `company_ticker` | Ticker symbol | `MSFT` |
+| `fiscal_year` | Year string | `2023` |
+| `document_type` | Source document type | `Annual_Report` |
+| `metadata_type` | Chunk type discriminator | `table` |
+| `table_markdown` | Full markdown table | `"| Revenue | ..."` |
+| `table_description` | Table description (embedded) | `"Revenue by segment FY2023"` |
+| `index` | Source page number | `42` |
+
+**Step 7 — Neo4j knowledge graph construction**
+
+The graph is built using Cypher `MERGE` statements (idempotent — safe to re-run):
+
+```cypher
+-- Core document structure (created first)
+MERGE (c:Company {ticker: $ticker, cik: $cik})
+MERGE (fy:FiscalYear {year: $fiscal_year})
+MERGE (d:Document {document_id: $document_id})
+MERGE (dt:DocumentType {name: $document_type})
+MERGE (d)-[:BELONGS_TO]->(c)
+MERGE (d)-[:BELONGS_TO]->(fy)
+MERGE (d)-[:IS_TYPE]->(dt)
+
+-- Key persons (deduplicated by name using UNWIND)
+MERGE (d:Document {document_id: $document_id})
+UNWIND $rows AS row
+MERGE (n:KeyPerson {name: row.name})
+SET n += row
+MERGE (d)-[:MENTIONS]->(n)
+
+-- Key developments (deduplicated by title)
+MERGE (n:KeyDevelopment {title: row.title})
+SET n += row
+MERGE (d)-[:MENTIONS]->(n)
+```
+
+---
+
+### Notebook 2 — SEC Edgar (10-K Filings)
+
+**File:** `ingestion-and-parsing/SEC_Edgar.ipynb`
+
+Processes the official SEC 10-K annual filings for all 7 companies using the `edgartools` Python library. 10-K filings provide structured XBRL financial data that is more machine-readable than the glossy PDF reports.
+
+**Company coverage:** All 7 — AAPL, MSFT, GOOGL, AMZN, NVDA, META, TSLA
+
+#### Pipeline Architecture
+
+```
+[edgartools Company API]
+         |
+         +──────────────────────────────────────────────────────+
+         |                                                        |
+         v                                                        v
+[10-K Filing — Text extraction]              [Financial Facts API (3 years)]
+  (clean text, tables excluded)               income / balance / cash flow
+         |                                                        |
+         v                                                        v
+[Chunk by paragraph with overlap]                [generate_document_core_graph_cypher()]
+  target: 1200 chars | overlap: 12%                              |
+         |                                                        v
+         v                                              [insert_financial_facts()]
+[Generate embeddings]                                            |
+  text-embedding-3-small                                         v
+         |                                                  NEO4J GRAPH
+         v                              (Company → FiscalYear → Document → Fact → Metric)
+[PINECONE metadata_type="text"]
+         |
+[Financial Statements]
+  (balance sheet, income statement,
+   cash flow, equity, comprehensive)
+         |
+         v
+[Render each statement as markdown]
+[Embed statement title as description]
+         |
+         v
+[PINECONE metadata_type="table"]
+```
+
+#### Step-by-Step Breakdown
+
+**Step 1 — Extract 10-K filing content with edgartools**
+
+The `edgartools` library provides a high-level Python API over the SEC EDGAR system. The notebook uses it to access four levels of financial data: Company → Filings → Filing → XBRL Statements.
+
+```python
+# Filter 10-K filings from 2023 onwards
+company = Company(ticker)
+filings = company.get_filings()
+annual_reports = filings.filter(form="10-K", date="2023-01-01:")
+```
+
+For each filing, text and all five financial statements are extracted:
+
+```python
+tenk = report.obj()
+
+# Clean narrative text without tables
+ai_text = tenk.document.text(clean=True, include_tables=False)
+
+# XBRL financial statements
+xbrl       = report.xbrl()
+statements = xbrl.statements
+balance_sheet      = statements.balance_sheet()
+income_statement   = statements.income_statement()
+cash_flow          = statements.cashflow_statement()
+equity             = statements.statement_of_equity()
+comprehensive      = statements.comprehensive_income()
+```
+
+**Step 2 — Vectorise report text**
+
+The clean narrative text (tables excluded to avoid duplication) is chunked and embedded using the same strategy as the PDF notebook: `target_chunk_size=1200`, `overlap_ratio=0.12`.
+
+Metadata stored alongside each text vector:
+
+```python
+{
+    "text":           chunk_content,
+    "company_ticker": "AAPL",
+    "fiscal_year":    "2024",
+    "document_type":  "FORM_10K",
+    "metadata_type":  "text"
+}
+```
+
+**Step 3 — Vectorise financial statement tables**
+
+Each of the five financial statements is rendered to markdown and inserted into Pinecone. The **statement title** (first two lines of the rendered markdown) is used as the embedding input — this ensures semantic search on the statement type rather than on noisy numerical content:
+
+```python
+md    = statement.render().to_markdown()
+title = "
+".join(md.split("
+
+")[:2])   # e.g. "Apple Inc.
+Consolidated Statements of Operations"
+```
+
+```python
+# Metadata for each statement table vector
+{
+    "table_markdown":    full_markdown_table,
+    "table_description": title,              # ← embedded
+    "company_ticker":    "AAPL",
+    "fiscal_year":       "2024",
+    "document_type":     "FORM_10K",
+    "metadata_type":     "table"
+}
+```
+
+**Step 4 — Extract and insert financial facts into Neo4j**
+
+The `edgartools` Company API returns concise, LLM-friendly financial fact objects for the past 3 fiscal years, covering income statement, balance sheet, and cash flow statement:
+
+```python
+income_stats  = company.income_statement(periods=3, concise_format=True)
+balance_stats = company.balance_sheet(periods=3, concise_format=True)
+cash_stats    = company.cashflow_statement(periods=3, concise_format=True)
+
+# to_llm_context() returns period-prefixed key-value pairs, e.g.:
+# { "revenuefromcontract_fy_2023": 394328000000, ... }
+context = income_stats.to_llm_context(flatten_values=True)
+```
+
+The raw XBRL metric names (lowercase compound strings) are converted to readable PascalCase:
+
+```python
+def snake_to_pascal(name: str) -> str:
+    # "revenuefromcontractwithcustomer" → "RevenueFromContractWithCustomer"
+    words = re.findall(r'[a-zA-Z][^A-Z]*', name)
+    return "".join(word.capitalize() for word in words)
+```
+
+Each fact is inserted as a `Fact` node linked to a `Metric` node and back to the `Document`:
+
+```cypher
+MATCH (d:Document {document_id: $document_id})
+MERGE (m:Metric {name: $metric_name})
+CREATE (f:Fact {value: $value, fiscal_year: $fiscal_year, company_ticker: $company_ticker})
+MERGE (d)-[:REPORTS]->(f)
+MERGE (f)-[:FOR_METRIC]->(m)
+```
+
+The `metricNameIndex` fulltext index on `Metric.name` is then used by the app's financial graph tools to perform fuzzy searches against these metric names.
+
+---
+
+### Ingestion Prerequisites
+
+| Dependency | Used by | Purpose |
+|-----------|---------|---------|
+| `pymupdf` / `pymupdf4llm` | PDF notebook | PDF → PNG rasterisation |
+| `mistralai` | PDF notebook | Mistral Document AI OCR client |
+| `openai` | Both | Azure OpenAI embeddings + GPT-4o-mini extraction |
+| `tenacity` | Both | Retry with exponential backoff |
+| `edgartools` | SEC Edgar notebook | EDGAR API wrapper for 10-K filings |
+| `pinecone` | Both | Vector database client |
+| `neo4j` | Both | Graph database driver |
+| `supabase` | PDF notebook | Intermediate JSON file storage |
+| `tqdm` | Both | Progress bars |
+
+### Required Credentials (Google Colab secrets)
+
+| Secret name | Value |
+|-------------|-------|
+| `azure_openai` | Azure OpenAI API key |
+| `azure_openai_endpoint` | Azure OpenAI endpoint URL |
+| `pinecone` | Pinecone API key |
+| `neo4j_uri` | Neo4j connection URI |
+| `neo4j_password` | Neo4j password |
+| `supabase_url` | Supabase project URL (PDF notebook) |
+| `supabase_secret` | Supabase service role key (PDF notebook) |
+
+### Recommended Execution Order
+
+```
+1. Run SEC_Edgar.ipynb first
+   └─ Populates Pinecone (FORM_10K text + tables) and Neo4j (all 7 companies)
+
+2. Run PDF_Annual_Shareholder_Reports.ipynb
+   └─ Adds Annual_Report text + tables to Pinecone
+   └─ Adds KeyPerson and KeyDevelopment nodes to Neo4j
+   └─ Uses Supabase Storage as an intermediate checkpoint
+```
+
+Running SEC Edgar first ensures the core `Company`, `FiscalYear`, and `Document` nodes exist in Neo4j before the PDF notebook attempts to attach `KeyPerson` and `KeyDevelopment` nodes to them.
+
+---
+
+---
+
+## Next JS Web App
+
+#### Pre-requisites
 
 | Tool | Minimum Version |
 |------|----------------|
@@ -72,20 +531,32 @@ magnificent7-financial-analyst/
 | Supabase project | — |
 | Pinecone account + index | — |
 | Neo4j instance | 5.x |
-| OpenAI API key | GPT-4o access |
+| OpenAI API key | GPT-5-mini access |
 
----
+#### Tech Stack
 
-## Local Setup
+| Layer | Technology |
+|-------|-----------|
+| Framework | Next.js 15 (App Router) |
+| Styling | Tailwind CSS v3 |
+| UI Components | shadcn/ui (canary) |
+| Auth | Supabase SSR |
+| Agent | LangChain JS + LangGraph |
+| LLM | OpenAI GPT-4o |
+| Vector DB | Pinecone |
+| Graph DB | Neo4j |
+| Deployment | Vercel |
 
-### 1. Clone the repo
+### Local Setup
+
+#### 1. Clone the repo
 
 ```bash
 git clone <your-repo-url>
 cd magnificent7-financial-analyst
 ```
 
-### 2. Install dependencies
+#### 2. Install dependencies
 
 ```bash
 npm install
@@ -93,7 +564,7 @@ npm install
 pnpm install
 ```
 
-### 3. Configure environment variables
+#### 3. Configure environment variables
 
 ```bash
 cp .env.local.example .env.local
@@ -101,25 +572,7 @@ cp .env.local.example .env.local
 
 Open `.env.local` and fill in **all** values:
 
-```env
-# Supabase
-NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
-
-# OpenAI
-OPENAI_API_KEY=sk-...
-
-# Pinecone
-PINECONE_API_KEY=your-pinecone-api-key
-PINECONE_INDEX_NAME=your-index-name
-
-# Neo4j
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USERNAME=neo4j
-NEO4J_PASSWORD=your-password
-```
-
-### 4. Configure Supabase Authentication
+#### 4. Configure Supabase Authentication
 
 1. In your Supabase dashboard, go to **Authentication → Providers** and enable **Email**.
 2. Disable **Sign-ups** (Settings → Authentication → Disable signups) since this app is login-only.
@@ -128,13 +581,21 @@ NEO4J_PASSWORD=your-password
    - Local: `http://localhost:3000/api/auth/callback`
    - Production: `https://your-domain.vercel.app/api/auth/callback`
 
-### 5. Run the dev server
+#### 5. Run the dev server
 
 ```bash
 npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000) — you'll be redirected to the login page.
+
+
+### Development Tips
+
+- **Streaming:** The chat API route uses `ReadableStream` to stream LLM tokens to the client in real-time.
+- **Agent tracing:** Set `LANGCHAIN_TRACING_V2=true` and `LANGCHAIN_API_KEY=...` in `.env.local` to trace agent runs in LangSmith.
+- **Adding companies:** To extend beyond the Magnificent 7, just ingest new data into Pinecone/Neo4j with the appropriate `ticker` metadata — no code changes required.
+- **Replacing the markdown renderer:** The lightweight renderer in `MessageBubble.tsx` handles common cases. For production, swap it with `react-markdown` + `remark-gfm` for full CommonMark support.
 
 ---
 
@@ -307,25 +768,3 @@ https://your-domain.vercel.app/api/auth/callback
 
 ---
 
-## Development Tips
-
-- **Streaming:** The chat API route uses `ReadableStream` to stream LLM tokens to the client in real-time.
-- **Agent tracing:** Set `LANGCHAIN_TRACING_V2=true` and `LANGCHAIN_API_KEY=...` in `.env.local` to trace agent runs in LangSmith.
-- **Adding companies:** To extend beyond the Magnificent 7, just ingest new data into Pinecone/Neo4j with the appropriate `ticker` metadata — no code changes required.
-- **Replacing the markdown renderer:** The lightweight renderer in `MessageBubble.tsx` handles common cases. For production, swap it with `react-markdown` + `remark-gfm` for full CommonMark support.
-
----
-
-## Tech Stack
-
-| Layer | Technology |
-|-------|-----------|
-| Framework | Next.js 15 (App Router) |
-| Styling | Tailwind CSS v3 |
-| UI Components | shadcn/ui (canary) |
-| Auth | Supabase SSR |
-| Agent | LangChain JS + LangGraph |
-| LLM | OpenAI GPT-4o |
-| Vector DB | Pinecone |
-| Graph DB | Neo4j |
-| Deployment | Vercel |
