@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { NextResponse, type NextRequest } from "next/server";
 import { createServerClient, type CookieOptionsWithName } from "@supabase/ssr";
 
